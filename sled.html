@@ -1,0 +1,1311 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Realistic Non-Inverting Ice Luge</title>
+  <style>
+    body { margin: 0; overflow: hidden; background-color: #d6eaf8; }
+    #info {
+      position: absolute; top: 10px; width: 100%;
+      text-align: center; color: #002244;
+      font-family: 'Segoe UI', sans-serif; font-weight: 800;
+      letter-spacing: 1px; pointer-events: none; z-index: 10;
+      text-shadow: 0px 0px 5px white;
+    }
+    #controls-ui { position: absolute; bottom: 20px; left: 20px; z-index: 10; }
+    button {
+      padding: 12px 24px; background: rgba(255,255,255,0.9); color: #002244;
+      border: 3px solid #002244; border-radius: 30px; cursor: pointer;
+      font-size: 16px; font-weight: bold; text-transform: uppercase;
+      box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+      transition: transform 0.1s; pointer-events: auto;
+    }
+    button:hover { transform: scale(1.05); }
+    #stats {
+      position: absolute; top: 60px; left: 20px;
+      color: #002244; font-family: monospace; font-size: 14px; font-weight: bold;
+      background: rgba(255,255,255,0.85); padding: 12px; border-radius: 8px;
+      pointer-events: none; border-left: 5px solid #002244;
+      max-width: 520px;
+    }
+    #loading {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      color: #002244; font-family: sans-serif; font-size: 22px; font-weight: bold;
+      background: rgba(255,255,255,0.95); padding: 34px; border-radius: 18px;
+      text-align: center; z-index: 20; box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    }
+  </style>
+
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="info">REALISTIC ICE LUGE (NO INVERSIONS)<br/>Desktop: Press 'C' to Toggle Camera</div>
+  <div id="stats">Loading…</div>
+  <div id="controls-ui">
+    <button id="view-btn">Switch Camera (C)</button>
+    <button id="restart-btn">Restart Run</button>
+  </div>
+  <div id="loading">Upgrading visuals (HDRI + ice decals)…</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { VRButton } from 'three/addons/webxr/VRButton.js';
+    import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+    import { Sky } from 'three/addons/objects/Sky.js';
+
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+    import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
+    import { FXAAShader } from 'three/addons/shaders/FXAAShader.js';
+
+    import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
+
+    // ---- CONFIG ----
+    const CONFIG = {
+      g: 9.81,
+      mass: 120,
+      segments: 5200,
+      trackWidth: 1.5,
+      snowCount: 2000,
+
+      rhoAir: 1.225,
+      CdA: 0.30,
+
+      muMin: 0.0045,
+      muMax: 0.0068,
+
+      targetLength: 1014.0,
+      targetDrop: 95.55,
+
+      bankMaxDeg: 50,
+      minUpDot: 0.20,
+
+      bankSmoothPasses: 4,
+      bankSmoothWindowMeters: 18,
+      maxBankRateDegPerM: 1.35,
+
+      tangentWindowMeters: 10,
+      curvatureWindowMeters: 24,
+
+      insideMaxFractionOfRadius: 0.40,
+      insideSmoothPasses: 4,
+      insideSmoothWindowMeters: 22
+    };
+
+    // ---- STATE ----
+    let scene, camera, renderer;
+    let composer = null, renderPass = null, fxaaPass = null, bloomPass = null;
+
+    let sceneSun = null;
+    let sky = null;
+
+    let sledGroup, dolly, cameraTarget;
+    let curve;
+    let trackFrames = [];
+    let trackS = [];
+    let snowSystem;
+    let clock = new THREE.Clock();
+    let viewMode = 'HELMET';
+
+    // Visual-only meshes
+    let trackIceMesh = null;
+    let trackSnowShellMesh = null;
+    let snowBermMesh = null;
+
+    // Visual-only overlays
+    let iceSheenMesh = null;   // wet glints + scrape lines
+    let frostEdgeMesh = null;  // frosty edges buildup
+
+    // Textures
+    let texSnow = null, texSnowN = null, texSnowR = null;
+    let texIceBump = null, texIceRough = null;
+    let texScratches = null;     // alphaMap + slight roughness variation
+    let texFrostEdges = null;    // alphaMap for edges
+
+    // Environment
+    const env = {
+      pmrem: null,
+      hdriLoaded: false,
+      hdriName: 'Winter River (Poly Haven)',
+      hdriUrl: 'https://dl.polyhaven.org/file/ph-assets/HDRIs/exr/1k/winter_river_1k.exr'
+    };
+
+    const physics = { s: 0, v: 0, finished: false };
+    const _tmp = new THREE.Vector3();
+    const _worldUp = new THREE.Vector3(0,1,0);
+
+    // ---- “REAL WORLD INSPIRED” (approximate, non-proprietary macro profile) ----
+    const RAW_NODES = [
+      [  0,  98,    0],
+      [  2,  94,  -60],
+      [ 20,  88, -120],
+      [ 45,  82, -190],
+      [ 55,  78, -260],
+      [ 30,  72, -330],
+      [  0,  66, -400],
+      [-35,  60, -470],
+      [-55,  54, -540],
+      [-48,  48, -610],
+      [-20,  42, -680],
+      [ 15,  36, -750],
+      [ 50,  30, -820],
+      [ 60,  24, -885],
+      [ 25,  16, -940],
+      [  0,  10, -985],
+      [  0,   0, -1030],
+    ];
+
+    init();
+
+    function init() {
+      scene = new THREE.Scene();
+
+      camera = new THREE.PerspectiveCamera(90, window.innerWidth / window.innerHeight, 0.05, 3000);
+
+      renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+      renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+      renderer.setSize(window.innerWidth, window.innerHeight);
+
+      renderer.xr.enabled = true;
+      renderer.xr.setReferenceSpaceType('local-floor');
+
+      renderer.shadowMap.enabled = true;
+      renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      renderer.toneMapping = THREE.ACESFilmicToneMapping;
+      renderer.toneMappingExposure = 1.05;
+
+      renderer.outputColorSpace = THREE.SRGBColorSpace;
+
+      document.body.appendChild(renderer.domElement);
+      document.body.appendChild(VRButton.createButton(renderer));
+
+      env.pmrem = new THREE.PMREMGenerator(renderer);
+
+      // Fallback environment while HDRI downloads
+      scene.environment = env.pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+      setupSkyAndSun();
+
+      const hemi = new THREE.HemisphereLight(0xcfe8ff, 0xbfd0b8, 0.55);
+      scene.add(hemi);
+      scene.add(new THREE.AmbientLight(0xffffff, 0.15));
+
+      createSled();
+      generateTrack();       // (physics/centerline unchanged)
+      loadVisualTextures();  // includes decals
+      createEnvironment();
+      createSnow();
+
+      // Replace fallback reflections with real winter HDRI (CC0)
+      loadHDRIEnvironment();
+
+      setupPostprocessing();
+
+      window.addEventListener('resize', onWindowResize);
+      document.getElementById('view-btn').addEventListener('click', toggleView);
+      document.getElementById('restart-btn').addEventListener('click', restart);
+      window.addEventListener('keydown', (e) => {
+        if(e.key.toLowerCase() === 'c') toggleView();
+        if(e.key === ' ') restart();
+      });
+
+      document.getElementById('loading').style.display = 'none';
+      renderer.setAnimationLoop(render);
+    }
+
+    function setupSkyAndSun() {
+      // Keep sky for haze/fog + sun direction; background will switch to HDRI once loaded.
+      sky = new Sky();
+      sky.scale.setScalar(6000);
+      scene.add(sky);
+
+      const skyU = sky.material.uniforms;
+      skyU.turbidity.value = 2.2;
+      skyU.rayleigh.value = 1.0;
+      skyU.mieCoefficient.value = 0.004;
+      skyU.mieDirectionalG.value = 0.82;
+
+      sceneSun = new THREE.DirectionalLight(0xffffff, 1.35);
+      sceneSun.position.set(-70, 180, 90);
+      sceneSun.castShadow = true;
+      sceneSun.shadow.mapSize.set(2048, 2048);
+      sceneSun.shadow.camera.near = 1;
+      sceneSun.shadow.camera.far = 1200;
+      sceneSun.shadow.camera.left = -550;
+      sceneSun.shadow.camera.right = 550;
+      sceneSun.shadow.camera.top = 550;
+      sceneSun.shadow.camera.bottom = -550;
+      sceneSun.shadow.bias = -0.0003;
+      scene.add(sceneSun);
+
+      const sunDir = sceneSun.position.clone().normalize();
+      skyU.sunPosition.value.copy(sunDir.multiplyScalar(1000));
+
+      scene.background = new THREE.Color(0xcfe8ff);
+      scene.fog = new THREE.FogExp2(0xcfe8ff, 0.00135);
+    }
+
+    function setupPostprocessing() {
+      composer = new EffectComposer(renderer);
+      renderPass = new RenderPass(scene, camera);
+      composer.addPass(renderPass);
+
+      fxaaPass = new ShaderPass(FXAAShader);
+      composer.addPass(fxaaPass);
+
+      const size = new THREE.Vector2(window.innerWidth, window.innerHeight);
+      bloomPass = new UnrealBloomPass(size, 0.28, 0.70, 0.92);
+      composer.addPass(bloomPass);
+
+      updateFXAAResolution();
+    }
+
+    function updateFXAAResolution() {
+      if(!fxaaPass) return;
+      const pixelRatio = renderer.getPixelRatio();
+      fxaaPass.material.uniforms['resolution'].value.set(
+        1 / (window.innerWidth * pixelRatio),
+        1 / (window.innerHeight * pixelRatio)
+      );
+    }
+
+    function loadHDRIEnvironment() {
+      const loader = new EXRLoader();
+      loader.setCrossOrigin('anonymous');
+
+      loader.load(
+        env.hdriUrl,
+        (exrTex) => {
+          exrTex.mapping = THREE.EquirectangularReflectionMapping;
+
+          // PMREM for correct PBR reflections
+          const envMap = env.pmrem.fromEquirectangular(exrTex).texture;
+
+          scene.environment = envMap;
+          scene.background = exrTex; // real panorama skybox
+          if(sky) sky.visible = false; // HDRI replaces procedural sky for realism
+
+          env.hdriLoaded = true;
+
+          // Slightly more “cold daylight” exposure once HDRI is active
+          renderer.toneMappingExposure = 0.98;
+
+          // Clean up intermediate (PMREM keeps its own)
+          exrTex.dispose();
+
+          // Refresh materials that rely on envMapIntensity
+          scene.traverse((o) => {
+            if(o.isMesh && o.material && o.material.envMapIntensity !== undefined) {
+              o.material.needsUpdate = true;
+            }
+          });
+        },
+        undefined,
+        () => {
+          env.hdriLoaded = false;
+          // Keep fallback environment/sky
+        }
+      );
+    }
+
+    function toggleView() {
+      viewMode = viewMode === 'HELMET' ? 'TV' : 'HELMET';
+      document.getElementById('info').innerHTML = `View: ${viewMode}`;
+    }
+
+    function restart() {
+      physics.s = 0;
+      physics.v = 6.0;
+      physics.finished = false;
+
+      if(trackFrames.length) {
+        const f = trackFrames[0];
+        sledGroup.position.copy(f.pos);
+        sledGroup.quaternion.copy(f.rot);
+      }
+    }
+
+    // =========================
+    // === PHYSICS/TRACK CODE ===
+    // =========================
+    // (UNCHANGED)
+
+    function computeTrackSFromSamples(arr){
+      const cum = new Array(arr.length);
+      cum[0]=0;
+      let L=0;
+      for(let i=1;i<arr.length;i++){
+        L += arr[i].distanceTo(arr[i-1]);
+        cum[i]=L;
+      }
+      return cum;
+    }
+
+    function dsApprox() {
+      if(trackS.length < 2) return 0.2;
+      return trackS[trackS.length-1] / (trackS.length - 1);
+    }
+    function metersToFrames(m) {
+      const ds = Math.max(1e-4, dsApprox());
+      return Math.max(1, Math.floor(m / ds));
+    }
+    function clampI(i, n) { return Math.max(0, Math.min(n, i)); }
+
+    function smoothBoxPass(arr, halfWindow) {
+      const n = arr.length;
+      const out = new Array(n);
+      let sum = 0;
+      let count = 0;
+
+      const w0a = 0;
+      const w0b = Math.min(n-1, halfWindow);
+      sum = 0; count = 0;
+      for(let k=w0a; k<=w0b; k++){ sum += arr[k]; count++; }
+      out[0] = sum / count;
+
+      for(let i=1;i<n;i++){
+        const prevA = Math.max(0, i-1-halfWindow);
+        const prevB = Math.min(n-1, i-1+halfWindow);
+        const nextA = Math.max(0, i-halfWindow);
+        const nextB = Math.min(n-1, i+halfWindow);
+
+        for(let k=prevA; k<nextA; k++){ sum -= arr[k]; count--; }
+        for(let k=prevB+1; k<=nextB; k++){ sum += arr[k]; count++; }
+
+        out[i] = sum / Math.max(1, count);
+      }
+      return out;
+    }
+
+    function smoothMultiPass(arr, passes, halfWindow) {
+      let a = arr.slice();
+      for(let p=0;p<passes;p++){
+        a = smoothBoxPass(a, halfWindow);
+      }
+      return a;
+    }
+
+    function rateLimitByDistance(arr, maxRatePerM) {
+      const n = arr.length;
+      const out = arr.slice();
+      for(let i=1;i<n;i++){
+        const ds = Math.max(1e-4, trackS[i] - trackS[i-1]);
+        const maxDelta = maxRatePerM * ds;
+        const d = out[i] - out[i-1];
+        if(d > maxDelta) out[i] = out[i-1] + maxDelta;
+        else if(d < -maxDelta) out[i] = out[i-1] - maxDelta;
+      }
+      return out;
+    }
+
+    function generateTrack() {
+      const nodes = RAW_NODES.map(p => new THREE.Vector3(p[0], p[1], p[2]));
+      curve = new THREE.CatmullRomCurve3(nodes, false);
+      curve.curveType = 'centripetal';
+      curve.tension = 0.0;
+
+      const steps = CONFIG.segments;
+      let samples = new Array(steps + 1);
+      for(let i=0;i<=steps;i++){
+        samples[i] = curve.getPointAt(i/steps).clone();
+      }
+
+      const y0 = samples[0].y;
+      const yN = samples[samples.length-1].y;
+      const dropNow = (y0 - yN) || 1;
+      const yScale = CONFIG.targetDrop / dropNow;
+
+      for(const p of samples){
+        p.y = (p.y - yN) * yScale + yN;
+      }
+      samples[0].y = CONFIG.targetDrop;
+      samples[samples.length-1].y = 0;
+
+      let prevY = samples[0].y;
+      for(let i=1;i<samples.length;i++){
+        if(samples[i].y > prevY - 0.02) samples[i].y = prevY - 0.02;
+        prevY = samples[i].y;
+      }
+      samples[samples.length-1].y = Math.min(samples[samples.length-2].y - 0.02, 0);
+
+      trackS = computeTrackSFromSamples(samples);
+      const lengthNow = trackS[trackS.length-1] || 1;
+      const xzScale = CONFIG.targetLength / lengthNow;
+      for(const p of samples){
+        p.x *= xzScale;
+        p.z *= xzScale;
+      }
+      trackS = computeTrackSFromSamples(samples);
+
+      const geomHalfWin = metersToFrames(14);
+      for(let pass=0; pass<3; pass++){
+        const xs = samples.map(p=>p.x);
+        const zs = samples.map(p=>p.z);
+        const xSm = smoothBoxPass(xs, geomHalfWin);
+        const zSm = smoothBoxPass(zs, geomHalfWin);
+        for(let i=0;i<samples.length;i++){
+          samples[i].x = xSm[i];
+          samples[i].z = zSm[i];
+        }
+
+        let py = samples[0].y;
+        for(let i=1;i<samples.length;i++){
+          if(samples[i].y > py - 0.02) samples[i].y = py - 0.02;
+          py = samples[i].y;
+        }
+        samples[samples.length-1].y = Math.min(samples[samples.length-2].y - 0.02, 0);
+        trackS = computeTrackSFromSamples(samples);
+      }
+
+      const tanW = metersToFrames(CONFIG.tangentWindowMeters);
+      const tangents = new Array(samples.length);
+      for(let i=0;i<samples.length;i++){
+        const a = clampI(i - tanW, steps);
+        const b = clampI(i + tanW, steps);
+        const tvec = samples[b].clone().sub(samples[a]);
+        if(tvec.lengthSq() < 1e-9) tvec.set(0,0,-1);
+        tangents[i] = tvec.normalize();
+      }
+
+      const curvW = metersToFrames(CONFIG.curvatureWindowMeters);
+      const Rarr = new Array(samples.length);
+      const insideSignArr = new Array(samples.length);
+
+      for(let i=0;i<samples.length;i++){
+        const a = clampI(i - curvW, steps);
+        const b = clampI(i + curvW, steps);
+
+        const tA = tangents[a].clone();
+        const tB = tangents[b].clone();
+
+        const c = tB.sub(tA);
+        c.y = 0;
+
+        const th = tangents[i].clone(); th.y = 0;
+        if(th.lengthSq() < 1e-9) th.set(0,0,-1);
+        th.normalize();
+
+        const rightFlat = new THREE.Vector3().crossVectors(th, _worldUp);
+        if(rightFlat.lengthSq() < 1e-9) rightFlat.set(1,0,0);
+        rightFlat.normalize();
+
+        let insideSign = 0;
+        if(c.lengthSq() > 1e-10){
+          c.normalize();
+          const d = c.dot(rightFlat);
+          if(Math.abs(d) > 1e-5) insideSign = Math.sign(d);
+        }
+        insideSignArr[i] = insideSign;
+
+        const ha = tangents[a].clone(); ha.y = 0;
+        const hb = tangents[b].clone(); hb.y = 0;
+        if(ha.lengthSq() < 1e-9 || hb.lengthSq() < 1e-9){
+          Rarr[i] = 1e9;
+        } else {
+          ha.normalize(); hb.normalize();
+          const dot = THREE.MathUtils.clamp(ha.dot(hb), -1, 1);
+          const angle = Math.acos(dot);
+          const ds = Math.max(1e-4, trackS[b] - trackS[a]);
+          const k = angle / ds;
+          Rarr[i] = (k > 1e-6) ? (1 / k) : 1e9;
+        }
+      }
+
+      const hStart = samples[0].y;
+      const rawBank = new Array(samples.length).fill(0);
+      for(let i=0;i<samples.length;i++){
+        const R = Rarr[i];
+        const insideSign = insideSignArr[i];
+
+        const dh = Math.max(0, hStart - samples[i].y);
+        const vDesign = Math.min(42, Math.sqrt(6*6 + 2*CONFIG.g*dh) * 0.92);
+
+        let bankMag = 0;
+        if(insideSign !== 0 && R < 1e8){
+          const theta = Math.atan((vDesign*vDesign) / (CONFIG.g * Math.max(3.0, R)));
+          bankMag = THREE.MathUtils.radToDeg(theta);
+          bankMag = THREE.MathUtils.clamp(bankMag, 0, CONFIG.bankMaxDeg);
+        }
+        rawBank[i] = bankMag * insideSign;
+      }
+
+      const bankHalfWin = metersToFrames(CONFIG.bankSmoothWindowMeters) >> 1;
+      let bankSm = smoothMultiPass(rawBank, CONFIG.bankSmoothPasses, Math.max(2, bankHalfWin));
+      bankSm = rateLimitByDistance(bankSm, CONFIG.maxBankRateDegPerM);
+
+      const rawInside = new Array(samples.length).fill(0);
+      for(let i=0;i<samples.length;i++){
+        const insideSign = insideSignArr[i];
+        const strength = THREE.MathUtils.clamp(Math.abs(bankSm[i]) / CONFIG.bankMaxDeg, 0, 1);
+        rawInside[i] = insideSign * strength;
+      }
+      const insideHalfWin = metersToFrames(CONFIG.insideSmoothWindowMeters) >> 1;
+      let insideSm = smoothMultiPass(rawInside, CONFIG.insideSmoothPasses, Math.max(2, insideHalfWin));
+      insideSm = rateLimitByDistance(insideSm, 1.1);
+
+      trackFrames = [];
+      const qBank = new THREE.Quaternion();
+
+      for(let i=0;i<samples.length;i++){
+        const pos = samples[i].clone();
+        const tangent = tangents[i].clone();
+
+        let right = new THREE.Vector3().crossVectors(tangent, _worldUp);
+        if(right.lengthSq() < 1e-9) right.set(1,0,0);
+        right.normalize();
+        let up = new THREE.Vector3().crossVectors(right, tangent).normalize();
+
+        const bankDeg = bankSm[i];
+        if(bankDeg !== 0){
+          qBank.setFromAxisAngle(tangent, THREE.MathUtils.degToRad(bankDeg));
+          right.applyQuaternion(qBank).normalize();
+          up.applyQuaternion(qBank).normalize();
+        }
+
+        const upDot = up.dot(_worldUp);
+        if(upDot <= CONFIG.minUpDot){
+          right = new THREE.Vector3().crossVectors(tangent, _worldUp);
+          if(right.lengthSq() < 1e-9) right.set(1,0,0);
+          right.normalize();
+          up = new THREE.Vector3().crossVectors(right, tangent).normalize();
+        }
+
+        const zAxis = tangent.clone().negate();
+        const rotMat = new THREE.Matrix4().makeBasis(right, up, zAxis);
+        const rot = new THREE.Quaternion().setFromRotationMatrix(rotMat);
+
+        const slopeSin = THREE.MathUtils.clamp(-tangent.y, -0.99, 0.99);
+
+        trackFrames.push({
+          pos, rot, right, up, tangent,
+          R: Rarr[i],
+          s: trackS[i],
+          bankDeg,
+          slopeSin,
+          insideBias: insideSm[i],
+          insideSign: insideSignArr[i]
+        });
+      }
+
+      buildIceTrough(); // visuals only
+      restart();
+
+      document.getElementById('stats').innerHTML =
+        `TRACK BUILT<br>` +
+        `Length: ${trackS[trackS.length-1].toFixed(1)} m<br>` +
+        `Drop: ${(trackFrames[0].pos.y - trackFrames[trackFrames.length-1].pos.y).toFixed(2)} m<br>` +
+        `HDRI: loading…`;
+    }
+
+    function sampleAtS(s) {
+      const N = trackFrames.length;
+      const sMax = trackS[N-1];
+      const ss = THREE.MathUtils.clamp(s, 0, sMax);
+
+      let lo = 0, hi = N - 1;
+      while(lo + 1 < hi) {
+        const mid = (lo + hi) >> 1;
+        if(trackS[mid] <= ss) lo = mid;
+        else hi = mid;
+      }
+      const i0 = lo;
+      const i1 = Math.min(lo + 1, N - 1);
+      const s0 = trackS[i0];
+      const s1 = trackS[i1];
+      const alpha = (s1 > s0) ? ((ss - s0) / (s1 - s0)) : 0;
+
+      return { i0, i1, alpha, ss, sMax };
+    }
+
+    function updatePhysics(dt) {
+      if(physics.finished || trackFrames.length < 2) return;
+
+      const { i0, i1, alpha, ss, sMax } = sampleAtS(physics.s);
+      const f0 = trackFrames[i0];
+      const f1 = trackFrames[i1];
+
+      const slopeSin = THREE.MathUtils.lerp(f0.slopeSin, f1.slopeSin, alpha);
+      const cosSlope = Math.sqrt(Math.max(0, 1 - slopeSin*slopeSin));
+      const R = THREE.MathUtils.lerp(f0.R, f1.R, alpha);
+
+      const a_g = CONFIG.g * slopeSin;
+      const a_c = (R < 1e8) ? ((physics.v * physics.v) / Math.max(2.0, R)) : 0;
+      const N_over_m = (CONFIG.g * cosSlope) + a_c;
+
+      const mu = THREE.MathUtils.clamp(CONFIG.muMax - 0.00006 * physics.v, CONFIG.muMin, CONFIG.muMax);
+      const a_fric = mu * N_over_m;
+
+      const a_drag = (0.5 * CONFIG.rhoAir * CONFIG.CdA / CONFIG.mass) * physics.v * physics.v;
+
+      const a = a_g - a_fric - a_drag;
+
+      physics.v = Math.max(0, physics.v + a * dt);
+      physics.s = ss + physics.v * dt;
+
+      if(physics.s >= sMax) {
+        physics.s = sMax;
+        physics.finished = true;
+      }
+
+      const samp = sampleAtS(physics.s);
+      const A = trackFrames[samp.i0];
+      const B = trackFrames[samp.i1];
+
+      const centerPos = new THREE.Vector3().lerpVectors(A.pos, B.pos, samp.alpha);
+      const right = A.right.clone().lerp(B.right, samp.alpha).normalize();
+      const up = A.up.clone().lerp(B.up, samp.alpha).normalize();
+
+      const insideBiasNow = THREE.MathUtils.lerp(A.insideBias, B.insideBias, samp.alpha);
+
+      const r = CONFIG.trackWidth / 2;
+      const maxX = r * CONFIG.insideMaxFractionOfRadius;
+
+      const x = THREE.MathUtils.clamp(insideBiasNow * maxX, -0.95*r, 0.95*r);
+
+      const xr = THREE.MathUtils.clamp(x / r, -0.999, 0.999);
+      const ySurf = -Math.sqrt(Math.max(0, 1 - xr*xr)) * r;
+      const y = ySurf + (r * 0.20) + 0.06;
+
+      sledGroup.position.copy(centerPos)
+        .addScaledVector(right, x)
+        .addScaledVector(up, y);
+
+      sledGroup.quaternion.slerpQuaternions(A.rot, B.rot, samp.alpha);
+
+      if(snowSystem) {
+        const positions = snowSystem.geometry.attributes.position;
+        for(let i=0; i<CONFIG.snowCount; i++) {
+          let yy = positions.getY(i);
+          let zz = positions.getZ(i);
+
+          zz += (physics.v * 0.06) + 0.08;
+          yy -= 0.10;
+
+          if(zz > 18) zz = -18;
+          if(yy < -12) yy = 12;
+
+          positions.setY(i, yy);
+          positions.setZ(i, zz);
+        }
+        positions.needsUpdate = true;
+      }
+
+      const kmh = physics.v * 3.6;
+      const gNormal = N_over_m / CONFIG.g;
+
+      const hdrLine = env.hdriLoaded ? `HDRI: ${env.hdriName}` : `HDRI: loading…`;
+      document.getElementById('stats').innerHTML =
+        `SPEED: ${kmh.toFixed(0)} km/h<br>` +
+        `DIST: ${physics.s.toFixed(0)} m / ${sMax.toFixed(0)} m<br>` +
+        `NORMAL G: ${gNormal.toFixed(2)} g<br>` +
+        `${hdrLine}`;
+    }
+
+    // =========================
+    // === VISUAL ENHANCEMENTS ==
+    // =========================
+
+    function loadVisualTextures() {
+      const loader = new THREE.TextureLoader();
+
+      texSnow  = loader.load('https://threejs.org/examples/textures/snow.jpg');
+      texSnowN = loader.load('https://threejs.org/examples/textures/water/Water_1_M_Normal.jpg');
+      texSnowR = loader.load('https://threejs.org/examples/textures/terrain/grasslight-big.jpg');
+
+      for(const t of [texSnow, texSnowN, texSnowR]) {
+        t.wrapS = t.wrapT = THREE.RepeatWrapping;
+        t.repeat.set(80, 80);
+        t.anisotropy = 8;
+        t.colorSpace = (t === texSnow) ? THREE.SRGBColorSpace : THREE.NoColorSpace;
+      }
+
+      // Base ice microstructure
+      texIceBump = makeNoiseTexture(256, 256, { contrast: 1.1, scale: 1.0 });
+      texIceRough = makeNoiseTexture(256, 256, { contrast: 0.85, scale: 1.0 });
+      texIceBump.wrapS = texIceBump.wrapT = THREE.RepeatWrapping;
+      texIceRough.wrapS = texIceRough.wrapT = THREE.RepeatWrapping;
+      texIceBump.repeat.set(60, 6);
+      texIceRough.repeat.set(60, 6);
+      texIceBump.anisotropy = 8;
+      texIceRough.anisotropy = 8;
+
+      // Decals: scrape lines + frosty edges (procedural)
+      texScratches = makeScratchesAlphaTexture(512, 512);
+      texFrostEdges = makeFrostEdgeAlphaTexture(512, 512);
+
+      texScratches.wrapS = texScratches.wrapT = THREE.RepeatWrapping;
+      texFrostEdges.wrapS = texFrostEdges.wrapT = THREE.RepeatWrapping;
+
+      // Repeat along the track a lot; across profile only a little
+      texScratches.repeat.set(18, 2);
+      texFrostEdges.repeat.set(12, 1);
+
+      texScratches.anisotropy = 8;
+      texFrostEdges.anisotropy = 8;
+
+      if(trackIceMesh) {
+        trackIceMesh.material.bumpMap = texIceBump;
+        trackIceMesh.material.roughnessMap = texIceRough;
+        trackIceMesh.material.needsUpdate = true;
+      }
+
+      // If overlays already exist (rebuild), refresh
+      if(iceSheenMesh && iceSheenMesh.material) {
+        iceSheenMesh.material.alphaMap = texScratches;
+        iceSheenMesh.material.needsUpdate = true;
+      }
+      if(frostEdgeMesh && frostEdgeMesh.material) {
+        frostEdgeMesh.material.alphaMap = texFrostEdges;
+        frostEdgeMesh.material.needsUpdate = true;
+      }
+    }
+
+    function makeNoiseTexture(w, h, { contrast = 1.0, scale = 1.0 } = {}) {
+      const size = w * h;
+      const data = new Uint8Array(3 * size);
+
+      function rnd(i) {
+        let x = Math.sin(i * 127.1) * 43758.5453;
+        return x - Math.floor(x);
+      }
+
+      for(let y=0; y<h; y++){
+        for(let x=0; x<w; x++){
+          const i = y*w + x;
+          const n1 = rnd(i * 1.0);
+          const n2 = rnd(i * 2.13 + 1000.0) * 0.6;
+          const n3 = rnd(i * 5.77 + 3000.0) * 0.3;
+          let v = (n1 + n2 + n3) / (1.0 + 0.6 + 0.3);
+          v = Math.pow(THREE.MathUtils.clamp(v * scale, 0, 1), contrast);
+          const c = Math.floor(v * 255);
+
+          data[i*3+0] = c;
+          data[i*3+1] = c;
+          data[i*3+2] = c;
+        }
+      }
+
+      const tex = new THREE.DataTexture(data, w, h, THREE.RGBFormat);
+      tex.needsUpdate = true;
+      tex.colorSpace = THREE.NoColorSpace;
+      return tex;
+    }
+
+    function makeScratchesAlphaTexture(w, h) {
+      // Alpha = where wet glints/scrapes appear (streaks along V).
+      // Uses canvas so we can draw long thin lines + noise.
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+
+      // Base: very faint randomness
+      const img = ctx.createImageData(w, h);
+      for(let i=0;i<w*h;i++){
+        const v = Math.floor(10 + Math.random()*20); // low alpha base
+        img.data[i*4+0] = 255;
+        img.data[i*4+1] = 255;
+        img.data[i*4+2] = 255;
+        img.data[i*4+3] = v;
+      }
+      ctx.putImageData(img, 0, 0);
+
+      // Long scrape lines (mostly along V axis)
+      ctx.globalCompositeOperation = 'lighter';
+      for(let k=0;k<520;k++){
+        const x = Math.random()*w;
+        const y0 = Math.random()*h;
+        const len = (0.35 + Math.random()*0.75) * h;
+        const y1 = y0 + len;
+        const thickness = 0.4 + Math.random()*1.2;
+
+        ctx.strokeStyle = `rgba(255,255,255,${0.08 + Math.random()*0.18})`;
+        ctx.lineWidth = thickness;
+        ctx.beginPath();
+        ctx.moveTo(x, y0);
+        ctx.lineTo(x + (Math.random()-0.5)*12, y1);
+        ctx.stroke();
+      }
+
+      // A few “wet patches”
+      for(let p=0;p<60;p++){
+        const x = Math.random()*w;
+        const y = Math.random()*h;
+        const rx = 10 + Math.random()*55;
+        const ry = 18 + Math.random()*95;
+        const grd = ctx.createRadialGradient(x, y, 0, x, y, Math.max(rx, ry));
+        grd.addColorStop(0, `rgba(255,255,255,${0.18 + Math.random()*0.22})`);
+        grd.addColorStop(1, `rgba(255,255,255,0)`);
+        ctx.fillStyle = grd;
+        ctx.beginPath();
+        ctx.ellipse(x, y, rx, ry, Math.random()*Math.PI, 0, Math.PI*2);
+        ctx.fill();
+      }
+
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.NoColorSpace;
+      return tex;
+    }
+
+    function makeFrostEdgeAlphaTexture(w, h) {
+      // Alpha high near U edges (u ~ 0 or 1), low near center.
+      // Also adds speckle so edges look “packed/frosted”.
+      const c = document.createElement('canvas');
+      c.width = w; c.height = h;
+      const ctx = c.getContext('2d');
+      const img = ctx.createImageData(w, h);
+
+      for(let y=0;y<h;y++){
+        for(let x=0;x<w;x++){
+          const u = x/(w-1);
+
+          // Edge mask: two smoothstep ramps from edges inward
+          const eL = smoothstep(0.00, 0.22, 1.0 - u);
+          const eR = smoothstep(0.00, 0.22, u);
+          const edge = Math.max(eL, eR);
+
+          // Add speckle & variation
+          const speck = (Math.random()*0.35 + Math.random()*0.35) * edge;
+          const alpha = THREE.MathUtils.clamp((edge*0.75 + speck)*255, 0, 255) | 0;
+
+          const i = (y*w + x)*4;
+          img.data[i+0] = 255;
+          img.data[i+1] = 255;
+          img.data[i+2] = 255;
+          img.data[i+3] = alpha;
+        }
+      }
+
+      ctx.putImageData(img, 0, 0);
+      const tex = new THREE.CanvasTexture(c);
+      tex.colorSpace = THREE.NoColorSpace;
+      return tex;
+
+      function smoothstep(a, b, x){
+        const t = THREE.MathUtils.clamp((x-a)/(b-a), 0, 1);
+        return t*t*(3-2*t);
+      }
+    }
+
+    function buildIceTrough() {
+      // Remove old meshes if regenerating
+      if(trackIceMesh) scene.remove(trackIceMesh);
+      if(trackSnowShellMesh) scene.remove(trackSnowShellMesh);
+      if(snowBermMesh) scene.remove(snowBermMesh);
+      if(iceSheenMesh) scene.remove(iceSheenMesh);
+      if(frostEdgeMesh) scene.remove(frostEdgeMesh);
+
+      const LIP_TRIM = 0.55; // truncates top -> realistic wall height
+      const geo = new THREE.BufferGeometry();
+      const verts = [];
+      const normals = [];
+      const uvs = [];
+      const indices = [];
+
+      const radialSegments = 22;
+      const r = CONFIG.trackWidth / 2;
+      const totalFrames = trackFrames.length;
+
+      const aMin = -Math.PI + LIP_TRIM;
+      const aMax = -LIP_TRIM;
+
+      for(let i=0; i<totalFrames; i++) {
+        const f = trackFrames[i];
+        for(let j=0; j<=radialSegments; j++) {
+          const t = j / radialSegments;
+          const angle = THREE.MathUtils.lerp(aMin, aMax, t);
+
+          const x = Math.cos(angle) * r;
+          const y = Math.sin(angle) * r;
+
+          const v = f.pos.clone()
+            .addScaledVector(f.right, x)
+            .addScaledVector(f.up, y + (r * 0.20));
+
+          verts.push(v.x, v.y, v.z);
+          uvs.push(t * 6.0, i / 220);
+
+          const n = f.pos.clone().sub(v).normalize();
+          normals.push(n.x, n.y, n.z);
+        }
+      }
+
+      for(let i=0; i<totalFrames-1; i++) {
+        for(let j=0; j<radialSegments; j++) {
+          const a = i * (radialSegments + 1) + j;
+          const b = (i + 1) * (radialSegments + 1) + j;
+          const c = i * (radialSegments + 1) + (j + 1);
+          const d = (i + 1) * (radialSegments + 1) + (j + 1);
+          indices.push(a, b, d, a, d, c);
+        }
+      }
+
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+
+      // Inner ice: translucent with micro bump & roughness variation
+      const iceMat = new THREE.MeshPhysicalMaterial({
+        color: 0xeafcff,
+        metalness: 0.0,
+        roughness: 0.06,
+        transmission: 0.35,
+        thickness: 0.25,
+        ior: 1.31,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.06,
+        envMapIntensity: 1.35,
+        side: THREE.FrontSide,
+        transparent: true,
+        opacity: 1.0,
+        bumpMap: texIceBump || null,
+        bumpScale: 0.025,
+        roughnessMap: texIceRough || null
+      });
+
+      trackIceMesh = new THREE.Mesh(geo, iceMat);
+      trackIceMesh.receiveShadow = true;
+      trackIceMesh.castShadow = false;
+      scene.add(trackIceMesh);
+
+      // Outer shell: packed snow
+      const snowShellMat = new THREE.MeshStandardMaterial({
+        color: 0xf7fbff,
+        roughness: 0.95,
+        metalness: 0.0,
+        map: texSnow || null,
+        normalMap: texSnowN || null,
+        normalScale: new THREE.Vector2(0.22, 0.22),
+        roughnessMap: texSnowR || null,
+        side: THREE.BackSide
+      });
+
+      trackSnowShellMesh = new THREE.Mesh(geo, snowShellMat);
+      trackSnowShellMesh.receiveShadow = true;
+      trackSnowShellMesh.castShadow = true;
+      scene.add(trackSnowShellMesh);
+
+      // Snow berm ribbons along both edges
+      snowBermMesh = buildSnowBerms(totalFrames, r, aMax);
+      if(snowBermMesh) scene.add(snowBermMesh);
+
+      // --- NEW: Ice “specular skin” decal layer (scrapes + wet glints) ---
+      // Same geometry, polygonOffset to prevent z-fighting.
+      const sheenMat = new THREE.MeshPhysicalMaterial({
+        color: 0xffffff,
+        metalness: 0.0,
+        roughness: 0.02,               // very shiny
+        transmission: 0.0,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.02,
+        envMapIntensity: 1.8,
+        transparent: true,
+        opacity: 0.55,
+        alphaMap: texScratches || null,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+        side: THREE.FrontSide
+      });
+
+      iceSheenMesh = new THREE.Mesh(geo, sheenMat);
+      iceSheenMesh.renderOrder = 5;
+      scene.add(iceSheenMesh);
+
+      // --- NEW: Frosty edges decal layer (rough + white + edge-biased alpha) ---
+      const frostMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.98,
+        metalness: 0.0,
+        transparent: true,
+        opacity: 0.65,
+        alphaMap: texFrostEdges || null,
+        depthWrite: false,
+        polygonOffset: true,
+        polygonOffsetFactor: -3,
+        polygonOffsetUnits: -3,
+        side: THREE.FrontSide
+      });
+
+      frostEdgeMesh = new THREE.Mesh(geo, frostMat);
+      frostEdgeMesh.renderOrder = 6;
+      scene.add(frostEdgeMesh);
+    }
+
+    function buildSnowBerms(totalFrames, r, aTop) {
+      const xEdge = Math.cos(aTop) * r;
+      const yEdge = Math.sin(aTop) * r + (r * 0.20);
+
+      const bermWidth = 0.55;
+      const bermDrop = 0.18;
+
+      const verts = [];
+      const normals = [];
+      const uvs = [];
+      const indices = [];
+
+      for(let i=0;i<totalFrames;i++){
+        const f = trackFrames[i];
+        const u = i / (totalFrames - 1);
+
+        const leftEdge = f.pos.clone()
+          .addScaledVector(f.right, -xEdge)
+          .addScaledVector(f.up, yEdge);
+
+        const leftOuter = leftEdge.clone()
+          .addScaledVector(f.right, -bermWidth)
+          .addScaledVector(f.up, -bermDrop);
+
+        const rightEdge = f.pos.clone()
+          .addScaledVector(f.right, xEdge)
+          .addScaledVector(f.up, yEdge);
+
+        const rightOuter = rightEdge.clone()
+          .addScaledVector(f.right, bermWidth)
+          .addScaledVector(f.up, -bermDrop);
+
+        verts.push(leftEdge.x, leftEdge.y, leftEdge.z);
+        verts.push(leftOuter.x, leftOuter.y, leftOuter.z);
+        verts.push(rightEdge.x, rightEdge.y, rightEdge.z);
+        verts.push(rightOuter.x, rightOuter.y, rightOuter.z);
+
+        for(let k=0;k<4;k++){
+          normals.push(f.up.x, f.up.y, f.up.z);
+        }
+
+        uvs.push(0, u);
+        uvs.push(1, u);
+        uvs.push(0, u);
+        uvs.push(1, u);
+      }
+
+      for(let i=0;i<totalFrames-1;i++){
+        const base0 = i*4;
+        const base1 = (i+1)*4;
+
+        indices.push(base0+0, base0+1, base1+1);
+        indices.push(base0+0, base1+1, base1+0);
+
+        indices.push(base0+2, base0+3, base1+3);
+        indices.push(base0+2, base1+3, base1+2);
+      }
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+      geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+      geo.setAttribute('uv', new THREE.Float32BufferAttribute(uvs, 2));
+      geo.setIndex(indices);
+
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.98,
+        metalness: 0.0,
+        map: texSnow || null,
+        normalMap: texSnowN || null,
+        normalScale: new THREE.Vector2(0.18, 0.18),
+        side: THREE.DoubleSide
+      });
+
+      const mesh = new THREE.Mesh(geo, mat);
+      mesh.castShadow = true;
+      mesh.receiveShadow = true;
+      return mesh;
+    }
+
+    function createEnvironment() {
+      const floorGeo = new THREE.PlaneGeometry(3200, 3200, 160, 160);
+
+      const pos = floorGeo.attributes.position;
+      for(let i=0; i<pos.count; i++){
+        const x = pos.getX(i);
+        const y = pos.getY(i);
+        const n = (Math.sin(x*0.006) + Math.cos(y*0.0065)) * 0.6;
+        const n2 = (Math.sin(x*0.02 + y*0.018)) * 0.25;
+        pos.setZ(i, n + n2);
+      }
+      floorGeo.computeVertexNormals();
+
+      const floorMat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.98,
+        metalness: 0.0,
+        map: texSnow || null,
+        normalMap: texSnowN || null,
+        normalScale: new THREE.Vector2(0.35, 0.35),
+        roughnessMap: texSnowR || null
+      });
+
+      const floor = new THREE.Mesh(floorGeo, floorMat);
+      floor.rotation.x = -Math.PI / 2;
+      floor.position.y = -20;
+      floor.receiveShadow = true;
+      scene.add(floor);
+
+      const treeGeo = new THREE.ConeGeometry(5, 18, 6);
+      const treeMat = new THREE.MeshStandardMaterial({ color: 0x1d2f1d, roughness: 0.95 });
+      const treeMesh = new THREE.InstancedMesh(treeGeo, treeMat, 1600);
+
+      const dummy = new THREE.Object3D();
+      let count = 0;
+      for(let i=0; i<3200; i++) {
+        if(count >= 1600) break;
+        const x = (Math.random()-0.5)*1700;
+        const z = (Math.random()-0.5)*1700;
+
+        let safe = true;
+        for(let n of RAW_NODES) {
+          const dx = n[0] - x;
+          const dz = n[2] - z;
+          if(dx*dx + dz*dz < 2200) { safe = false; break; }
+        }
+
+        if(safe) {
+          dummy.position.set(x, -5, z);
+          const s = 0.6 + Math.random() * 1.6;
+          dummy.scale.set(s,s,s);
+          dummy.rotation.y = Math.random() * Math.PI * 2;
+          dummy.updateMatrix();
+          treeMesh.setMatrixAt(count++, dummy.matrix);
+        }
+      }
+      treeMesh.castShadow = true;
+      treeMesh.receiveShadow = true;
+      scene.add(treeMesh);
+    }
+
+    function createSled() {
+      sledGroup = new THREE.Group();
+      scene.add(sledGroup);
+
+      const shellGeo = new THREE.CapsuleGeometry(0.28, 1.4, 6, 18);
+      shellGeo.rotateX(Math.PI/2);
+      shellGeo.scale(1, 0.42, 1);
+
+      const shellMat = new THREE.MeshPhysicalMaterial({
+        color: 0xcc0000,
+        clearcoat: 1.0,
+        clearcoatRoughness: 0.12,
+        metalness: 0.65,
+        roughness: 0.22,
+        envMapIntensity: 1.2
+      });
+
+      const shell = new THREE.Mesh(shellGeo, shellMat);
+      shell.position.y = 0.15;
+      shell.castShadow = true;
+      sledGroup.add(shell);
+
+      const runnerGeo = new THREE.BoxGeometry(0.04, 0.04, 1.55);
+      const runnerMat = new THREE.MeshPhysicalMaterial({
+        color: 0xe6e6e6,
+        metalness: 1.0,
+        roughness: 0.18,
+        clearcoat: 0.6,
+        clearcoatRoughness: 0.25,
+        envMapIntensity: 1.2
+      });
+
+      const leftR = new THREE.Mesh(runnerGeo, runnerMat);
+      leftR.position.set(-0.2, 0.02, 0);
+      leftR.castShadow = true;
+      sledGroup.add(leftR);
+
+      const rightR = new THREE.Mesh(runnerGeo, runnerMat);
+      rightR.position.set(0.2, 0.02, 0);
+      rightR.castShadow = true;
+      sledGroup.add(rightR);
+
+      const noseGeo = new THREE.SphereGeometry(0.16, 16, 12);
+      const nose = new THREE.Mesh(noseGeo, shellMat);
+      nose.position.set(0, 0.16, 0.78);
+      nose.scale.set(1, 0.75, 1.25);
+      nose.castShadow = true;
+      sledGroup.add(nose);
+
+      dolly = new THREE.Group();
+      dolly.position.set(0, 0.26, 0.42);
+      sledGroup.add(dolly);
+
+      cameraTarget = new THREE.Object3D();
+      cameraTarget.position.set(0, 1.65, 4.2);
+      sledGroup.add(cameraTarget);
+    }
+
+    function createSnow() {
+      const geo = new THREE.BufferGeometry();
+      const verts = [];
+      for(let i=0; i<CONFIG.snowCount; i++) {
+        const x = (Math.random()-0.5)*28;
+        const y = (Math.random()-0.5)*18;
+        const z = (Math.random()-0.5)*36;
+        verts.push(x, y, z);
+      }
+      geo.setAttribute('position', new THREE.Float32BufferAttribute(verts, 3));
+
+      const mat = new THREE.PointsMaterial({
+        color: 0xffffff,
+        size: 0.045,
+        transparent: true,
+        opacity: 0.85,
+        depthWrite: false
+      });
+
+      snowSystem = new THREE.Points(geo, mat);
+      snowSystem.renderOrder = 10;
+      sledGroup.add(snowSystem);
+    }
+
+    // =========================
+    // === RENDER LOOP / UI   ===
+    // =========================
+
+    function render() {
+      const dt = clock.getDelta();
+      updatePhysics(dt);
+
+      const isVR = renderer.xr.isPresenting;
+      const effectiveMode = isVR ? 'HELMET' : viewMode;
+
+      if(effectiveMode === 'HELMET') {
+        if(camera.parent !== dolly) {
+          dolly.add(camera);
+          camera.position.set(0, 0, 0);
+          camera.rotation.set(0, 0, 0);
+          if(!isVR) camera.rotation.x = 0.15;
+        }
+      } else {
+        if(camera.parent !== scene) scene.add(camera);
+        _tmp.set(0, 0, 0);
+        cameraTarget.getWorldPosition(_tmp);
+        camera.position.lerp(_tmp, 0.1);
+        camera.lookAt(sledGroup.position);
+      }
+
+      // Desktop post; VR direct for performance/stability
+      if(!isVR && composer) composer.render();
+      else renderer.render(scene, camera);
+    }
+
+    function onWindowResize() {
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+
+      renderer.setSize(window.innerWidth, window.innerHeight);
+      if(composer) composer.setSize(window.innerWidth, window.innerHeight);
+      updateFXAAResolution();
+    }
+  </script>
+</body>
+</html>
